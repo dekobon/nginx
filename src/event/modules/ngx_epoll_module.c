@@ -780,6 +780,25 @@ ngx_epoll_notify(ngx_event_handler_pt handler)
 #endif
 
 
+/**
+ * @brief Core event processing loop for nginx epoll implementation
+ *
+ * Waits for events on registered file descriptors using epoll_wait() and processes them.
+ * This function is the heart of nginx's event-driven architecture for Linux systems.
+ * It handles read and write events, error conditions, and supports both immediate and 
+ * deferred (posted) event handling.
+ * 
+ * The function incorporates several key optimizations:
+ * - Instance tagging to detect stale events (connections that were closed during processing)
+ * - Intelligent error handling (EPOLL_ERR/HUP conditions force read/write handlers to run)
+ * - Special handling for EOF conditions via EPOLLRDHUP on supported systems
+ * - Support for batched event posting to improve locality of reference in heavy loads
+ * 
+ * @param cycle Current nginx cycle containing configuration and shared data
+ * @param timer Maximum time to wait for events in milliseconds (NGX_TIMER_INFINITE for no timeout)
+ * @param flags Special processing flags (NGX_UPDATE_TIME, NGX_POST_EVENTS)
+ * @return NGX_OK on success, NGX_ERROR on critical failure
+ */
 static ngx_int_t
 ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
 {
@@ -836,6 +855,12 @@ ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
     for (i = 0; i < events; i++) {
         c = event_list[i].data.ptr;
 
+        /* 
+         * Extract the instance tag stored in lowest bit of pointer.
+         * This tag changes when a connection object is reused, allowing
+         * us to detect stale events for file descriptors that are
+         * closed and then reallocated to new connections.
+         */
         instance = (uintptr_t) c & 1;
         c = (ngx_connection_t *) ((uintptr_t) c & (uintptr_t) ~1);
 
@@ -869,6 +894,12 @@ ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
              * to handle the events at least in one active handler
              */
 
+            /* 
+             * A key optimization: On error/hangup, we force both read and write 
+             * handlers to run by setting both event bits.
+             * This ensures proper cleanup even if only one direction was monitored,
+             * avoiding hanging connections and resource leaks.
+             */
             revents |= EPOLLIN|EPOLLOUT;
         }
 
@@ -883,6 +914,13 @@ ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
         if ((revents & EPOLLIN) && rev->active) {
 
 #if (NGX_HAVE_EPOLLRDHUP)
+            /* 
+             * EPOLLRDHUP is a Linux-specific extension that detects when a peer closes
+             * its end of the connection or shuts down the writing half of the connection.
+             * This allows for more graceful connection teardown and avoids "surprise EOF"
+             * conditions during reads. Marking pending_eof lets read handlers know
+             * they should expect no more data.
+             */
             if (revents & EPOLLRDHUP) {
                 rev->pending_eof = 1;
             }
@@ -892,6 +930,12 @@ ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
             rev->available = -1;
 
             if (flags & NGX_POST_EVENTS) {
+                /* 
+                 * Event posting is a critical optimization that improves performance
+                 * under high load by batching similar event types together.
+                 * Accept events go to a separate high-priority queue to ensure
+                 * new connections are processed promptly even under heavy load.
+                 */
                 queue = rev->accept ? &ngx_posted_accept_events
                                     : &ngx_posted_events;
 
@@ -913,6 +957,12 @@ ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
                  * that was just closed in this iteration
                  */
 
+                /* 
+                 * Second stale event check, this time for write events.
+                 * This is necessary because the connection could be closed 
+                 * by the read handler that ran earlier in this same iteration.
+                 * Without this check, we might call handlers on invalid connections.
+                 */
                 ngx_log_debug1(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
                                "epoll: stale event %p", c);
                 continue;
